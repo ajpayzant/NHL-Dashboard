@@ -1,1 +1,60 @@
+name: Daily NHL Data Refresh
 
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 14 * * *"   # 14:30 UTC ~ 6:30am Pacific (adjust if you want)
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run pipeline (writes parquet to ./data)
+        env:
+          NHL_DATA_ROOT: ./data/NHL_MoneyPuck
+          NHL_LOCAL_ROOT: ./tmp_nhl
+        run: |
+          python etl/run_pipeline.py
+
+      - name: Build warehouse DB
+        env:
+          NHL_DATA_ROOT: ./data/NHL_MoneyPuck
+        run: |
+          python etl/build_warehouse.py
+
+      - name: Build portable dashboard DB
+        env:
+          SRC_DB: ./data/NHL_MoneyPuck/warehouse/nhl_warehouse.duckdb
+          OUT_DB: ./artifacts/nhl_dashboard.duckdb
+          # OPTIONAL: keep it smaller for hosting:
+          # DASH_SEASONS: "2023,2024,2025"
+          DASH_SITUATIONS: "all,5v5,5on4,4on5"
+        run: |
+          python etl/build_portable_db.py
+
+      - name: Publish DB to GitHub Release (data-latest)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG="data-latest"
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" -t "Latest data" -n "Auto-updated DuckDB"
+          gh release upload "$TAG" artifacts/nhl_dashboard.duckdb --clobber
+          gh release upload "$TAG" artifacts/nhl_dashboard.meta.json --clobber
+          echo "✅ Uploaded release assets to $TAG"
