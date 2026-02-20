@@ -1,61 +1,86 @@
+# app/pages/05_Lines.py
 import streamlit as st
-from shared import DB_PATH, query_df, sidebar_filters, find_relation_with_cols
 
-st.title("🧩 Lines / Pairs")
+from shared import (
+    DB_PATH, top_filter_bar, query_df, find_relation_with_cols, cols_of, prep_table_for_display
+)
 
-season, situation = sidebar_filters(str(DB_PATH))
+st.header("Lines / Pairs")
 
-# Your pipeline creates derived lines keys; portable DB must include a relation for it.
-LINES_REQ = ["combo_key_team", "team", "season", "situation", "TOI"]
+season, situation = top_filter_bar(str(DB_PATH))
+
+LINES_REQ = ["combo_key_team","team","season","situation","TOI"]
+
 lines_rel = find_relation_with_cols(
     str(DB_PATH),
     required_cols=LINES_REQ,
-    prefer_names=("fact_lines_game", "lines_game_ready", "fact_line_game", "v_lines_src"),
+    prefer_names=("fact_lines_game","lines_game_ready","v_lines_game_src","fact_line_game"),
 )
 
 if not lines_rel:
     st.error(
-        "I can't find lines data inside your portable DB.\n\n"
-        "Fix: update `etl/build_portable_db.py` to copy the lines relation into the dashboard DB "
-        "(e.g., create `fact_lines_game` as a table/view in the portable DB)."
+        "Lines data not found in the portable DB.\n\n"
+        "You need your ETL to expose/copy one of these relations into the portable DB:\n"
+        "- fact_lines_game (preferred)\n"
+        "- lines_game_ready\n"
+        "- v_lines_game_src\n\n"
+        "Once you update `etl/build_warehouse.py` to create a lines view and update "
+        "`etl/build_portable_db.py` to copy it, this page will work."
     )
     st.stop()
 
-teams = query_df(str(DB_PATH), f"SELECT DISTINCT team FROM {lines_rel} ORDER BY team")["team"].tolist()
-team = st.selectbox("Team", teams)
+cols = set(cols_of(str(DB_PATH), lines_rel))
+
+teams = query_df(
+    str(DB_PATH),
+    f"SELECT DISTINCT team FROM {lines_rel} WHERE season=? AND situation=? ORDER BY team",
+    (season, situation),
+)
+if teams.empty:
+    st.warning("No lines rows for this season/situation.")
+    st.stop()
+
+team = st.selectbox("Team", teams["team"].tolist(), index=0)
+
+pos_col = "position" if "position" in cols else None
+pos = "line"
+if pos_col:
+    pos = st.radio("Type", ["line", "pair"], horizontal=True)
+
+min_toi = st.slider("Min TOI (season total)", 0.0, 500.0, 50.0, step=5.0)
+
+# Choose key metric columns if they exist
+metric_candidates = ["xgoalsfor_per60","xgoalsagainst_per60","goalsfor_per60","goalsagainst_per60","shotsongoalfor_per60","shotsongoalagainst_per60"]
+metrics = [m for m in metric_candidates if m in cols]
+
+base_cols = [c for c in ["team","season","situation","combo_key_team","combo_key_ids","TOI","p1_name","p2_name","p3_name"] if c in cols]
+select_cols = base_cols + metrics
 
 sql = f"""
-WITH base AS (
-  SELECT *
-  FROM {lines_rel}
-  WHERE season = ? AND situation = ? AND team = ? AND combo_key_team IS NOT NULL AND combo_key_team <> ''
-),
-agg AS (
-  SELECT
-    combo_key_team,
-    MAX(COALESCE(position, 'line')) AS position,
-    SUM(TRY_CAST(TOI AS DOUBLE)) AS toi,
-    SUM(TRY_CAST(xgoalsfor AS DOUBLE)) AS xgf,
-    SUM(TRY_CAST(xgoalsagainst AS DOUBLE)) AS xga,
-    SUM(TRY_CAST(goalsfor AS DOUBLE)) AS gf,
-    SUM(TRY_CAST(goalsagainst AS DOUBLE)) AS ga
-  FROM base
-  GROUP BY combo_key_team
-)
-SELECT
-  combo_key_team,
-  position,
-  toi,
-  gf, ga,
-  xgf, xga,
-  ROUND(xgf / NULLIF(xgf + xga, 0), 3) AS xgf_pct,
-  ROUND(gf / NULLIF(toi, 0) * 60, 3) AS gf_per60,
-  ROUND(ga / NULLIF(toi, 0) * 60, 3) AS ga_per60
-FROM agg
-ORDER BY toi DESC
-LIMIT 50;
+SELECT {", ".join(select_cols)}
+FROM {lines_rel}
+WHERE season=? AND situation=? AND team=? AND TOI >= ?
 """
+params = [season, situation, team, float(min_toi)]
 
-df = query_df(str(DB_PATH), sql, (season, situation, team))
-st.caption(f"Source: {lines_rel}")
-st.dataframe(df, use_container_width=True)
+if pos_col:
+    sql += " AND lower(CAST(position AS VARCHAR)) = ?"
+    params.append(pos)
+
+sql += " ORDER BY TOI DESC LIMIT 200"
+
+df = query_df(str(DB_PATH), sql, tuple(params))
+
+if df.empty:
+    st.info("No lines/pairs matched your filters.")
+    st.stop()
+
+# cleaner display: show a readable line name
+if "p1_name" in df.columns:
+    df["Combo"] = df[["p1_name","p2_name","p3_name"]].fillna("").agg(" / ".join, axis=1).str.replace(r"( / )+$", "", regex=True)
+
+show = ["Combo","TOI"] + metrics
+if "Combo" not in df.columns:
+    show = ["combo_key_team","TOI"] + metrics
+
+st.dataframe(prep_table_for_display(df[show]), width="stretch")
