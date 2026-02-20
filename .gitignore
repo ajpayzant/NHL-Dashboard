@@ -1,1 +1,15 @@
-
+# data + artifacts
+data/
+artifacts/
+*.duckdb
+*.parquet
+*.csv
+logs/
+raw/
+extracted/
+bronze*/
+silver*/
+gold*/
+tmp_nhl/
+__pycache__/
+.ipynb_checkpoints/
