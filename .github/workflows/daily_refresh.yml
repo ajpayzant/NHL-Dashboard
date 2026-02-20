@@ -43,7 +43,7 @@ jobs:
           SRC_DB: ./data/NHL_MoneyPuck/warehouse/nhl_warehouse.duckdb
           OUT_DB: ./artifacts/nhl_dashboard.duckdb
           # OPTIONAL: keep it smaller for hosting:
-          # DASH_SEASONS: "2023,2024,2025"
+          DASH_SEASONS: "2015,2016,2017,2018,2019,2020,2021,2022,2023,2024,2025"
           DASH_SITUATIONS: "all,5v5,5on4,4on5"
         run: |
           python etl/build_portable_db.py
