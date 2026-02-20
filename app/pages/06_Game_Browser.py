@@ -1,67 +1,99 @@
+# app/pages/06_Game_Browser.py
 import streamlit as st
-from datetime import date
-from shared import DB_PATH, query_df, sidebar_filters, find_relation_with_cols
 
-st.title("🗓️ Game Browser")
-
-season, situation = sidebar_filters(str(DB_PATH))
-
-TEAM_REQ = ["team", "season", "situation", "gamedate", "gameid", "goalsfor", "goalsagainst"]
-team_rel = find_relation_with_cols(
-    str(DB_PATH),
-    required_cols=TEAM_REQ,
-    prefer_names=("fact_team_game", "v_teams_src", "fact_teams_game"),
+from shared import (
+    DB_PATH, top_filter_bar, query_df, find_relation_with_cols, cols_of, prep_table_for_display, relation_exists
 )
-if not team_rel:
-    st.error(f"Missing team fact relation with required columns: {TEAM_REQ}")
+
+st.header("Game Browser")
+
+season, situation = top_filter_bar(str(DB_PATH))
+
+if not relation_exists(str(DB_PATH), "dim_game"):
+    st.error("dim_game not found in portable DB. Copy it into the portable DB to enable the game browser.")
     st.stop()
 
-teams = query_df(str(DB_PATH), f"SELECT DISTINCT team FROM {team_rel} ORDER BY team")["team"].tolist()
-team_filter = st.multiselect("Teams (optional)", teams, default=[])
-
-# date bounds from data
-bounds = query_df(
+games = query_df(
     str(DB_PATH),
-    f"""
-    SELECT MIN(gamedate) AS dmin, MAX(gamedate) AS dmax
-    FROM {team_rel}
-    WHERE season = ? AND situation = ?;
+    """
+    SELECT gameid, gamedate, home_team, away_team, home_goals, away_goals
+    FROM dim_game
+    WHERE season=?
+    ORDER BY gamedate DESC
     """,
-    (season, situation)
+    (season,),
 )
-dmin = bounds.loc[0, "dmin"]
-dmax = bounds.loc[0, "dmax"]
 
-c1, c2 = st.columns(2)
-with c1:
-    start = st.date_input("Start date", value=dmin if dmin else date(season, 10, 1))
-with c2:
-    end = st.date_input("End date", value=dmax if dmax else date(season + 1, 4, 30))
+if games.empty:
+    st.warning("No games found for that season.")
+    st.stop()
 
-where_team = ""
-params = [season, situation, start, end]
-if team_filter:
-    placeholders = ", ".join(["?"] * len(team_filter))
-    where_team = f" AND team IN ({placeholders}) "
-    params += team_filter
+games_disp = games.copy()
+games_disp["label"] = games_disp.apply(
+    lambda r: f"{str(r['gamedate'])[:10]} — {r['away_team']} @ {r['home_team']} ({r['away_goals']}-{r['home_goals']})",
+    axis=1
+)
 
-sql = f"""
-SELECT
-  gamedate,
-  gameid,
-  team,
-  TRY_CAST(goalsfor AS INTEGER) AS gf,
-  TRY_CAST(goalsagainst AS INTEGER) AS ga
-FROM {team_rel}
-WHERE season = ?
-  AND situation = ?
-  AND gamedate >= ?
-  AND gamedate <= ?
-  {where_team}
-ORDER BY gamedate DESC, gameid DESC
-LIMIT 500;
-"""
+pick = st.selectbox("Select game", games_disp["label"].tolist(), index=0)
+gameid = games_disp.loc[games_disp["label"] == pick, "gameid"].iloc[0]
 
-df = query_df(str(DB_PATH), sql, tuple(params))
-st.caption(f"Source: {team_rel}")
-st.dataframe(df, use_container_width=True)
+TEAM_REQ = ["gameid","team","season","situation","gamedate"]
+team_rel = find_relation_with_cols(str(DB_PATH), TEAM_REQ, prefer_names=("fact_team_game","v_teams_src"))
+SK_REQ = ["gameid","playerid","name","team","season","situation","gamedate"]
+sk_rel = find_relation_with_cols(str(DB_PATH), SK_REQ, prefer_names=("fact_skater_game","v_skaters_src"))
+GO_REQ = ["gameid","playerid","name","team","season","situation","gamedate"]
+go_rel = find_relation_with_cols(str(DB_PATH), GO_REQ, prefer_names=("fact_goalie_game","v_goalies_src"))
+
+tabs = st.tabs(["Team Totals", "Skaters", "Goalies"])
+
+with tabs[0]:
+    if not team_rel:
+        st.info("Team fact relation not found.")
+    else:
+        cols = set(cols_of(str(DB_PATH), team_rel))
+        want = [c for c in ["gamedate","team","goalsfor","goalsagainst","xgoalsfor","xgoalsagainst","shotsongoalfor","shotsongoalagainst","shotattemptsfor","shotattemptsagainst"] if c in cols]
+        df = query_df(
+            str(DB_PATH),
+            f"""
+            SELECT {", ".join(want)}
+            FROM {team_rel}
+            WHERE season=? AND situation=? AND gameid=?
+            """,
+            (season, situation, str(gameid)),
+        )
+        st.dataframe(prep_table_for_display(df), width="stretch")
+
+with tabs[1]:
+    if not sk_rel:
+        st.info("Skater fact relation not found.")
+    else:
+        cols = set(cols_of(str(DB_PATH), sk_rel))
+        want = [c for c in ["gamedate","team","name","TOI","i_f_goals","i_f_points","i_f_shotsongoal","i_f_xgoals"] if c in cols]
+        df = query_df(
+            str(DB_PATH),
+            f"""
+            SELECT {", ".join(want)}
+            FROM {sk_rel}
+            WHERE season=? AND situation=? AND gameid=?
+            ORDER BY TOI DESC
+            """,
+            (season, situation, str(gameid)),
+        )
+        st.dataframe(prep_table_for_display(df), width="stretch")
+
+with tabs[2]:
+    if not go_rel:
+        st.info("Goalie fact relation not found.")
+    else:
+        cols = set(cols_of(str(DB_PATH), go_rel))
+        want = [c for c in ["gamedate","team","name","ongoal","goals","xgoals","TOI"] if c in cols]
+        df = query_df(
+            str(DB_PATH),
+            f"""
+            SELECT {", ".join(want)}
+            FROM {go_rel}
+            WHERE season=? AND situation=? AND gameid=?
+            """,
+            (season, situation, str(gameid)),
+        )
+        st.dataframe(prep_table_for_display(df), width="stretch")
