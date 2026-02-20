@@ -1447,8 +1447,8 @@ def run_pipeline():
     if RUN_LINES_READY: steps.append(("lines_ready", build_lines_ready))
     if RUN_GOLD:        steps.append(("gold", gold_build_all))
     # If you pasted your repair/audit functions, re-enable:
-    # if RUN_REPAIR:      steps.append(("repair_goalie_toi", auto_repair_goalie_toi_on_gold))
-    # if RUN_AUDIT:       steps.append(("audit", run_audit))
+    if RUN_REPAIR:      steps.append(("repair_goalie_toi", auto_repair_goalie_toi_on_gold))
+    if RUN_AUDIT:       steps.append(("audit", run_audit))
 
     results = {"run_id": RUN_ID, "run_at": utc_now_iso(), "steps": []}
 
