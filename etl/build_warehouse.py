@@ -1,12 +1,14 @@
+# etl/build_warehouse.py
 # ======================================================================================
 # DASHBOARD WAREHOUSE BUILD (DuckDB)
 #   - Builds: dim_player, dim_team, dim_game, dim_line_combo
-#   - Creates: fact views: fact_team_game, fact_skater_game, fact_goalie_game, fact_lines_game, fact_lines_season
+#   - Creates: fact views: fact_team_game, fact_skater_game, fact_goalie_game,
+#                      fact_lines_game, fact_lines_season
 #   - Writes:  <DATA_ROOT>/warehouse/nhl_warehouse.duckdb
 #
-# CHANGES vs your notebook:
-#   - no Colab paths; uses NHL_DATA_ROOT + PIPELINE_TAG to find GOLD
-#   - includes lines_game_ready + lines_season_ready
+# Key fix:
+#   - Facts read ALL situations (all, 5v5, 5on4, 4on5) from GOLD parquet
+#   - Dims still built from situation=all to avoid duplicates and keep stable
 # ======================================================================================
 
 import os, glob
@@ -39,33 +41,50 @@ def _sql_list(files: list[str]) -> str:
 def _sample_cols(file_path: str) -> set[str]:
     return set([f.name for f in pq.ParquetFile(file_path).schema_arrow])
 
+def _create_empty_view(con, view_name: str, cols_sql: str):
+    # cols_sql example: "NULL::VARCHAR AS playerid, NULL::VARCHAR AS name"
+    con.execute(f"CREATE OR REPLACE VIEW {view_name} AS SELECT {cols_sql} WHERE FALSE;")
+
 print("Warehouse DB will be written to:", DB_PATH)
 print("GOLD_DIR:", GOLD_DIR)
 
 # ---------- COLLECT GOLD PART FILES ----------
-skater_files = (
+# DIMS: situation=all only (stable, avoids duplicates)
+skater_files_dim = (
     _list_files(str(GOLD_DIR / "gbg_skaters_hist_zip"   / "situation=all" / "season=*" / "part_*.parquet")) +
     _list_files(str(GOLD_DIR / "gbg_skaters_current_zip"/ "situation=all" / "season=*" / "part_*.parquet"))
 )
-goalie_files = (
+goalie_files_dim = (
     _list_files(str(GOLD_DIR / "gbg_goalies_hist_zip"   / "situation=all" / "season=*" / "part_*.parquet")) +
     _list_files(str(GOLD_DIR / "gbg_goalies_current_zip"/ "situation=all" / "season=*" / "part_*.parquet"))
 )
-team_files = _list_files(str(GOLD_DIR / "gbg_teams_all" / "situation=all" / "season=*" / "part_*.parquet"))
+team_files_dim = _list_files(str(GOLD_DIR / "gbg_teams_all" / "situation=all" / "season=*" / "part_*.parquet"))
 
-# Lines (NEW)
+# FACTS: all situations
+skater_files_fact = (
+    _list_files(str(GOLD_DIR / "gbg_skaters_hist_zip"   / "situation=*" / "season=*" / "part_*.parquet")) +
+    _list_files(str(GOLD_DIR / "gbg_skaters_current_zip"/ "situation=*" / "season=*" / "part_*.parquet"))
+)
+goalie_files_fact = (
+    _list_files(str(GOLD_DIR / "gbg_goalies_hist_zip"   / "situation=*" / "season=*" / "part_*.parquet")) +
+    _list_files(str(GOLD_DIR / "gbg_goalies_current_zip"/ "situation=*" / "season=*" / "part_*.parquet"))
+)
+team_files_fact = _list_files(str(GOLD_DIR / "gbg_teams_all" / "situation=*" / "season=*" / "part_*.parquet"))
+
+# Lines (already multi-situation by design)
 lines_game_files = _list_files(str(GOLD_DIR / "lines_game_ready" / "situation=*" / "season=*" / "part_*.parquet"))
 lines_season_files = _list_files(str(GOLD_DIR / "lines_season_ready" / "situation=*" / "season=*" / "part_*.parquet"))
 
-if not skater_files:
-    raise FileNotFoundError("No GOLD skater parquet files found.")
-if not goalie_files:
-    raise FileNotFoundError("No GOLD goalie parquet files found.")
-if not team_files:
-    raise FileNotFoundError("No GOLD team parquet files found.")
+# Validate core dims inputs exist (these are required)
+if not skater_files_dim:
+    raise FileNotFoundError("No GOLD skater parquet files found for situation=all (needed for dims).")
+if not goalie_files_dim:
+    raise FileNotFoundError("No GOLD goalie parquet files found for situation=all (needed for dims).")
+if not team_files_dim:
+    raise FileNotFoundError("No GOLD team parquet files found for situation=all (needed for dims).")
 
-# Detect goalie ID column safely
-g_cols = _sample_cols(goalie_files[0])
+# Detect goalie ID column safely from dim goalie file
+g_cols = _sample_cols(goalie_files_dim[0])
 if "playerid" in g_cols:
     GOALIE_ID_COL = "playerid"
 elif "goalieid" in g_cols:
@@ -73,12 +92,13 @@ elif "goalieid" in g_cols:
 else:
     raise ValueError(f"Goalie parquet missing both playerid and goalieid. Columns seen: {sorted(list(g_cols))[:50]}")
 
-# Detect team columns for game build
-t_cols = _sample_cols(team_files[0])
+# Detect team columns for dim_game build
+t_cols = _sample_cols(team_files_dim[0])
 HAS_OPP = ("opp_team" in t_cols)
 HAS_HOA = ("home_or_away" in t_cols)
 
-print(f"Found GOLD files | skaters={len(skater_files)} goalies={len(goalie_files)} teams={len(team_files)}")
+print(f"Found GOLD dim files | skaters(all)={len(skater_files_dim)} goalies(all)={len(goalie_files_dim)} teams(all)={len(team_files_dim)}")
+print(f"Found GOLD fact files | skaters(*)={len(skater_files_fact)} goalies(*)={len(goalie_files_fact)} teams(*)={len(team_files_fact)}")
 print(f"Found GOLD lines | lines_game_ready={len(lines_game_files)} lines_season_ready={len(lines_season_files)}")
 print("Goalie id column:", GOALIE_ID_COL)
 print("Team has opp_team:", HAS_OPP, "| has home_or_away:", HAS_HOA)
@@ -89,29 +109,55 @@ con.execute(f"PRAGMA threads={DUCKDB_THREADS};")
 con.execute(f"PRAGMA memory_limit='{DUCKDB_MEM_LIMIT}';")
 
 # ---------- SOURCE VIEWS ----------
+# DIM sources (situation=all)
 con.execute(f"""
-CREATE OR REPLACE VIEW v_skaters_src AS
-SELECT * FROM read_parquet({_sql_list(skater_files)}, union_by_name=true);
+CREATE OR REPLACE VIEW v_skaters_dim_src AS
+SELECT * FROM read_parquet({_sql_list(skater_files_dim)}, union_by_name=true);
+""")
+con.execute(f"""
+CREATE OR REPLACE VIEW v_goalies_dim_src AS
+SELECT * FROM read_parquet({_sql_list(goalie_files_dim)}, union_by_name=true);
+""")
+con.execute(f"""
+CREATE OR REPLACE VIEW v_teams_dim_src AS
+SELECT * FROM read_parquet({_sql_list(team_files_dim)}, union_by_name=true);
 """)
 
-con.execute(f"""
-CREATE OR REPLACE VIEW v_goalies_src AS
-SELECT * FROM read_parquet({_sql_list(goalie_files)}, union_by_name=true);
-""")
+# FACT sources (all situations)
+# If for some reason the fact list is empty, fallback to dim list (safe).
+if skater_files_fact:
+    con.execute(f"""
+    CREATE OR REPLACE VIEW v_skaters_src AS
+    SELECT * FROM read_parquet({_sql_list(skater_files_fact)}, union_by_name=true);
+    """)
+else:
+    con.execute("CREATE OR REPLACE VIEW v_skaters_src AS SELECT * FROM v_skaters_dim_src;")
 
-con.execute(f"""
-CREATE OR REPLACE VIEW v_teams_src AS
-SELECT * FROM read_parquet({_sql_list(team_files)}, union_by_name=true);
-""")
+if goalie_files_fact:
+    con.execute(f"""
+    CREATE OR REPLACE VIEW v_goalies_src AS
+    SELECT * FROM read_parquet({_sql_list(goalie_files_fact)}, union_by_name=true);
+    """)
+else:
+    con.execute("CREATE OR REPLACE VIEW v_goalies_src AS SELECT * FROM v_goalies_dim_src;")
 
-# Lines views (NEW) — only create if files exist
+if team_files_fact:
+    con.execute(f"""
+    CREATE OR REPLACE VIEW v_teams_src AS
+    SELECT * FROM read_parquet({_sql_list(team_files_fact)}, union_by_name=true);
+    """)
+else:
+    con.execute("CREATE OR REPLACE VIEW v_teams_src AS SELECT * FROM v_teams_dim_src;")
+
+# Lines views — create only if files exist
 if lines_game_files:
     con.execute(f"""
     CREATE OR REPLACE VIEW v_lines_game_src AS
     SELECT * FROM read_parquet({_sql_list(lines_game_files)}, union_by_name=true);
     """)
 else:
-    con.execute("CREATE OR REPLACE VIEW v_lines_game_src AS SELECT NULL::VARCHAR AS combo_key_team WHERE FALSE;")
+    _create_empty_view(con, "v_lines_game_src",
+                       "NULL::VARCHAR AS combo_key_team, NULL::VARCHAR AS team, NULL::INTEGER AS season, NULL::VARCHAR AS situation, NULL::DOUBLE AS TOI")
 
 if lines_season_files:
     con.execute(f"""
@@ -119,9 +165,10 @@ if lines_season_files:
     SELECT * FROM read_parquet({_sql_list(lines_season_files)}, union_by_name=true);
     """)
 else:
-    con.execute("CREATE OR REPLACE VIEW v_lines_season_src AS SELECT NULL::VARCHAR AS combo_key_team WHERE FALSE;")
+    _create_empty_view(con, "v_lines_season_src",
+                       "NULL::VARCHAR AS combo_key_team, NULL::VARCHAR AS team, NULL::INTEGER AS season, NULL::VARCHAR AS situation, NULL::DOUBLE AS TOI")
 
-# ---------- dim_player (same fixed union-by-shape logic) ----------
+# ---------- dim_player (fixed union-by-shape) ----------
 con.execute(f"""
 CREATE OR REPLACE TABLE dim_player AS
 WITH
@@ -133,7 +180,7 @@ sk AS (
         CAST(team AS VARCHAR)            AS team,
         CAST(season AS INTEGER)          AS season,
         CAST(gamedate AS DATE)           AS gamedate
-    FROM v_skaters_src
+    FROM v_skaters_dim_src
     WHERE playerid IS NOT NULL AND CAST(playerid AS VARCHAR) <> ''
 ),
 go AS (
@@ -144,7 +191,7 @@ go AS (
         CAST(team AS VARCHAR)            AS team,
         CAST(season AS INTEGER)          AS season,
         CAST(gamedate AS DATE)           AS gamedate
-    FROM v_goalies_src
+    FROM v_goalies_dim_src
     WHERE {GOALIE_ID_COL} IS NOT NULL AND CAST({GOALIE_ID_COL} AS VARCHAR) <> ''
 ),
 base AS (
@@ -169,12 +216,12 @@ GROUP BY playerid;
 con.execute("""
 CREATE OR REPLACE TABLE dim_team AS
 SELECT DISTINCT CAST(team AS VARCHAR) AS team
-FROM v_teams_src
+FROM v_teams_dim_src
 WHERE team IS NOT NULL AND CAST(team AS VARCHAR) <> ''
 ORDER BY team;
 """)
 
-# ---------- dim_game ----------
+# ---------- dim_game (derived from situation=all team-game facts only) ----------
 home_away_logic = """
 CASE
   WHEN home_or_away IS NULL THEN NULL
@@ -201,7 +248,7 @@ WITH t AS (
         TRY_CAST(goalsagainst AS INTEGER) AS goalsagainst,
         TRY_CAST(xgoalsfor AS DOUBLE)     AS xgoalsfor,
         TRY_CAST(xgoalsagainst AS DOUBLE) AS xgoalsagainst
-    FROM v_teams_src
+    FROM v_teams_dim_src
     WHERE gameid IS NOT NULL
 ),
 t2 AS (
@@ -224,8 +271,7 @@ FROM t2
 GROUP BY gameid;
 """)
 
-# ---------- dim_line_combo (NEW; useful for app filters + combo pages) ----------
-# Uses season rollups if available; falls back to game-ready if season rollups absent.
+# ---------- dim_line_combo ----------
 con.execute("""
 CREATE OR REPLACE TABLE dim_line_combo AS
 WITH base AS (
@@ -270,7 +316,6 @@ con.execute("CREATE OR REPLACE VIEW fact_team_game   AS SELECT * FROM v_teams_sr
 con.execute("CREATE OR REPLACE VIEW fact_skater_game AS SELECT * FROM v_skaters_src;")
 con.execute("CREATE OR REPLACE VIEW fact_goalie_game AS SELECT * FROM v_goalies_src;")
 
-# Lines facts (NEW)
 con.execute("CREATE OR REPLACE VIEW fact_lines_game   AS SELECT * FROM v_lines_game_src;")
 con.execute("CREATE OR REPLACE VIEW fact_lines_season AS SELECT * FROM v_lines_season_src;")
 
@@ -280,12 +325,24 @@ n_teams   = con.execute("SELECT COUNT(*) FROM dim_team;").fetchone()[0]
 n_games   = con.execute("SELECT COUNT(*) FROM dim_game;").fetchone()[0]
 n_combos  = con.execute("SELECT COUNT(*) FROM dim_line_combo;").fetchone()[0]
 
+# Situations present in each fact (quick proof)
+s_team   = con.execute("SELECT situation, COUNT(*) n FROM fact_team_game GROUP BY situation ORDER BY situation;").df()
+s_skater = con.execute("SELECT situation, COUNT(*) n FROM fact_skater_game GROUP BY situation ORDER BY situation;").df()
+s_goalie = con.execute("SELECT situation, COUNT(*) n FROM fact_goalie_game GROUP BY situation ORDER BY situation;").df()
+
 print("\n✅ Warehouse build complete")
 print("DB_PATH:", DB_PATH)
 print("dim_player rows:", n_players)
 print("dim_team rows:", n_teams)
 print("dim_game rows:", n_games)
 print("dim_line_combo rows:", n_combos)
+
+print("\nSituations in fact_team_game:")
+print(s_team)
+print("\nSituations in fact_skater_game:")
+print(s_skater)
+print("\nSituations in fact_goalie_game:")
+print(s_goalie)
 
 print("\nSample dim_player:")
 print(con.execute("SELECT * FROM dim_player ORDER BY last_season DESC, fact_rows DESC LIMIT 10;").df())
