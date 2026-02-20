@@ -1,63 +1,114 @@
+# app/pages/04_Goalies.py
 import streamlit as st
-from shared import DB_PATH, query_df, sidebar_filters, find_relation_with_cols
+import pandas as pd
 
-st.title("🥅 Goalies")
-
-season, situation = sidebar_filters(str(DB_PATH))
-
-GOALIE_REQ = ["playerid", "name", "team", "season", "situation", "gamedate", "gameid"]
-goalie_rel = find_relation_with_cols(
-    str(DB_PATH),
-    required_cols=GOALIE_REQ,
-    prefer_names=("fact_goalie_game", "v_goalies_src", "fact_goalies_game"),
+from shared import (
+    DB_PATH, top_filter_bar, query_df, find_relation_with_cols, cols_of, prep_table_for_display, relation_exists
 )
-if not goalie_rel:
-    st.error(f"Missing goalie fact relation with required columns: {GOALIE_REQ}")
+
+st.header("Goalies")
+
+season, situation = top_filter_bar(str(DB_PATH))
+
+GO_REQ = ["playerid","name","team","season","situation","gamedate","TOI"]
+go_rel = find_relation_with_cols(str(DB_PATH), GO_REQ, prefer_names=("fact_goalie_game","v_goalies_src"))
+if not go_rel:
+    st.error("Goalie fact table not found.")
     st.stop()
+
+go_cols = set(cols_of(str(DB_PATH), go_rel))
 
 goalies = query_df(
     str(DB_PATH),
     f"""
     SELECT DISTINCT playerid, name
-    FROM {goalie_rel}
-    WHERE name IS NOT NULL AND playerid IS NOT NULL
+    FROM {go_rel}
+    WHERE season=? AND situation=?
     ORDER BY name
-    """
+    """,
+    (season, situation),
 )
-name_to_id = dict(zip(goalies["name"], goalies["playerid"]))
-goalie_name = st.selectbox("Goalie", goalies["name"].tolist())
-goalie_id = name_to_id[goalie_name]
+if goalies.empty:
+    st.warning("No goalies found for this season/situation.")
+    st.stop()
 
-summary = query_df(
+goalie_name = st.selectbox("Goalie", goalies["name"].tolist(), index=0)
+playerid = goalies.loc[goalies["name"] == goalie_name, "playerid"].iloc[0]
+
+st.subheader(goalie_name)
+
+# dim_player basic
+if relation_exists(str(DB_PATH), "dim_player"):
+    dim = query_df(str(DB_PATH), "SELECT * FROM dim_player WHERE playerid=?", (str(playerid),))
+    if not dim.empty:
+        r = dim.iloc[0].to_dict()
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Team", r.get("team_current",""))
+        c2.metric("First Season", r.get("first_season",""))
+        c3.metric("Last Season", r.get("last_season",""))
+        c4.metric("Fact Rows", r.get("fact_rows",""))
+
+# Career log
+st.divider()
+st.subheader("Career Log (by season + team)")
+
+need = [c for c in ["playerid","team","season","goals","xgoals","ongoal"] if c in go_cols]
+car = query_df(
     str(DB_PATH),
     f"""
-    SELECT
-      season,
-      situation,
-      MAX(team) AS team,
-      COUNT(*) AS gp
-    FROM {goalie_rel}
-    WHERE playerid = ?
-    GROUP BY season, situation
-    ORDER BY season DESC, situation;
+    SELECT {", ".join(need)}
+    FROM {go_rel}
+    WHERE playerid=?
     """,
-    (goalie_id,)
+    (str(playerid),),
 )
+if car.empty:
+    st.info("No career rows found.")
+    st.stop()
 
-st.subheader("Season / Situation availability")
-st.dataframe(summary, use_container_width=True)
+car["GP"] = 1
+agg = car.groupby(["season","team"], as_index=False).agg(GP=("GP","sum"))
+if "ongoal" in car.columns:
+    agg["SA"] = car.groupby(["season","team"])["ongoal"].sum().values
+if "goals" in car.columns:
+    agg["GA"] = car.groupby(["season","team"])["goals"].sum().values
+if "SA" in agg.columns and "GA" in agg.columns:
+    agg["SV"] = agg["SA"] - agg["GA"]
+    agg["SV%"] = (agg["SV"] / agg["SA"]).where(agg["SA"] > 0)
+if "xgoals" in car.columns and "GA" in agg.columns:
+    xga = car.groupby(["season","team"])["xgoals"].sum().values
+    agg["xGA"] = xga
+    agg["GSAx"] = agg["xGA"] - agg["GA"]
 
-st.subheader("Game log (filtered)")
-log = query_df(
+show = ["season","team","GP"] + [c for c in ["SA","GA","SV","SV%","xGA","GSAx"] if c in agg.columns]
+st.dataframe(prep_table_for_display(agg[show].sort_values(["season","team"], ascending=[False, True])), width="stretch")
+
+# Game logs
+st.divider()
+st.subheader("Game Logs")
+
+last_n = st.slider("Show last N games", 5, 50, 15, step=1)
+
+want = [c for c in ["gamedate","team","goals","xgoals","ongoal"] if c in go_cols]
+games = query_df(
     str(DB_PATH),
     f"""
-    SELECT *
-    FROM {goalie_rel}
-    WHERE playerid = ? AND season = ? AND situation = ?
-    ORDER BY gamedate, gameid;
+    SELECT {", ".join(want)}
+    FROM {go_rel}
+    WHERE season=? AND situation=? AND playerid=?
+    ORDER BY gamedate DESC
+    LIMIT ?
     """,
-    (goalie_id, season, situation)
+    (season, situation, str(playerid), int(last_n)),
 )
 
-st.caption(f"Source: {goalie_rel}")
-st.dataframe(log, use_container_width=True)
+if games.empty:
+    st.info("No games found for this filter.")
+    st.stop()
+
+if "ongoal" in games.columns and "goals" in games.columns:
+    games["SV"] = pd.to_numeric(games["ongoal"], errors="coerce") - pd.to_numeric(games["goals"], errors="coerce")
+    games["SV%"] = (games["SV"] / pd.to_numeric(games["ongoal"], errors="coerce")).where(pd.to_numeric(games["ongoal"], errors="coerce") > 0)
+
+keep = [c for c in ["gamedate","team","ongoal","goals","SV","SV%","xgoals"] if c in games.columns]
+st.dataframe(prep_table_for_display(games[keep]), width="stretch")
