@@ -1160,8 +1160,280 @@ def gold_build_all() -> Path:
     return manifest_path
 
 # --- REPAIR + AUDIT blocks unchanged from your notebook ---
-# (keeping your exact functions; omitted here only to keep file size manageable)
-# IMPORTANT: paste your existing REPAIR section and AUDIT section here verbatim.
+
+# ======================================================================================
+# REPAIR: cap goalie TOI to team TOI (runs on GOLD, situation=all)
+# ======================================================================================
+def recompute_goalie_features(df: pd.DataFrame, id_col: str) -> pd.DataFrame:
+    df = df.copy()
+    sort_cols = [c for c in [id_col, "gamedate", "gameid"] if c in df.columns]
+    df = df.sort_values(sort_cols).reset_index(drop=True)
+    grp = df.groupby(id_col, group_keys=False)
+
+    # base per60 columns
+    base_per60_cols = [c for c in df.columns if c.endswith("_per60") and ("_per60_L" not in c) and (not c.endswith("_per60_STD"))]
+    for c in base_per60_cols:
+        base = c[:-5]
+        if base in df.columns:
+            df[c] = np.where(df["TOI"] > 0, (df[base] / df["TOI"]) * 60.0, np.nan)
+
+    # rolling sums + STD bases
+    roll_bases = set(["TOI"])
+    for c in df.columns:
+        m = re.search(r"^(.*)_L(5|10|20)$", c)
+        if m and ("per60" not in c):
+            roll_bases.add(m.group(1))
+        if c.endswith("_STD") and ("per60" not in c):
+            roll_bases.add(c[:-4])
+
+    for base in sorted(roll_bases):
+        if base not in df.columns:
+            continue
+        std_col = f"{base}_STD"
+        if std_col in df.columns:
+            df[std_col] = grp[base].cumsum()
+        for w in (5,10,20):
+            col = f"{base}_L{w}"
+            if col in df.columns:
+                mp = w if STRICT_ROLLING else 1
+                df[col] = grp[base].rolling(window=w, min_periods=mp).sum().reset_index(level=0, drop=True)
+
+    # rolling per60
+    for w in (5,10,20):
+        toi_w = f"TOI_L{w}"
+        if toi_w not in df.columns:
+            continue
+        pattern = re.compile(rf"^(.*)_per60_L{w}$")
+        for c in df.columns:
+            m = pattern.match(c)
+            if not m:
+                continue
+            stat = m.group(1)
+            stat_w = f"{stat}_L{w}"
+            if stat_w in df.columns:
+                df[c] = np.where(df[toi_w] > 0, (df[stat_w] / df[toi_w]) * 60.0, np.nan)
+
+    if "TOI_STD" in df.columns:
+        pattern_std = re.compile(r"^(.*)_per60_STD$")
+        for c in df.columns:
+            m = pattern_std.match(c)
+            if not m:
+                continue
+            stat = m.group(1)
+            stat_std = f"{stat}_STD"
+            if stat_std in df.columns:
+                df[c] = np.where(df["TOI_STD"] > 0, (df[stat_std] / df["TOI_STD"]) * 60.0, np.nan)
+
+    return df
+
+def cap_goalie_toi_to_team(goalie_file: Path, team_file: Path) -> dict:
+    if (not goalie_file.exists()) or (not team_file.exists()):
+        return {"status": "missing_inputs"}
+
+    g = pd.read_parquet(goalie_file, engine="pyarrow")
+    t = pd.read_parquet(team_file, engine="pyarrow")
+
+    if not all(c in g.columns for c in ["gameid","team","TOI"]) or not all(c in t.columns for c in ["gameid","team","TOI"]):
+        return {"status": "missing_cols"}
+
+    id_col = "goalieid" if "goalieid" in g.columns else ("playerid" if "playerid" in g.columns else None)
+    if id_col is None:
+        return {"status": "missing_id_col"}
+
+    team_map = t[["gameid","team","TOI"]].rename(columns={"TOI":"TEAM_TOI"})
+    g2 = g.merge(team_map, on=["gameid","team"], how="left")
+
+    cap_mask = g2["TEAM_TOI"].notna() & (pd.to_numeric(g2["TOI"], errors="coerce") > pd.to_numeric(g2["TEAM_TOI"], errors="coerce") + 1e-9)
+    n_cap = int(cap_mask.sum())
+    if n_cap == 0:
+        return {"status": "no_caps_needed"}
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = goalie_file.with_suffix(f".parquet.bak_{ts}")
+    shutil.copy2(goalie_file, backup_path)
+
+    g2.loc[cap_mask, "TOI"] = g2.loc[cap_mask, "TEAM_TOI"]
+    g2 = g2.drop(columns=["TEAM_TOI"])
+
+    g3 = recompute_goalie_features(g2, id_col=id_col)
+    g3.to_parquet(goalie_file, index=False, engine="pyarrow")
+
+    return {"status": "patched", "rows_capped": n_cap, "backup": str(backup_path)}
+
+def auto_repair_goalie_toi_on_gold() -> dict:
+    report = {"run_id": RUN_ID, "items": []}
+    if not AUTO_REPAIR_GOALIE_TOI:
+        return report
+
+    for ds_key in ["gbg_goalies_hist_zip", "gbg_goalies_current_zip"]:
+        base = GOLD_DIR / ds_key / "situation=all"
+        if not base.exists():
+            continue
+
+        for season_dir in sorted(base.glob("season=*")):
+            season = int(season_dir.name.split("=",1)[1])
+            gfile = season_dir / "part_00000.parquet"
+            tfile = GOLD_DIR / "gbg_teams_all" / "situation=all" / f"season={season}" / "part_00000.parquet"
+            if not gfile.exists() or not tfile.exists():
+                continue
+
+            try:
+                df = pd.read_parquet(gfile, columns=["TOI"], engine="pyarrow")
+                max_toi = float(pd.to_numeric(df["TOI"], errors="coerce").max(skipna=True))
+            except Exception:
+                continue
+
+            # goalie TOI above ~70 is suspicious; repair if needed
+            if max_toi <= 70:
+                continue
+
+            res = cap_goalie_toi_to_team(gfile, tfile)
+            report["items"].append({"dataset_key": ds_key, "season": season, "max_TOI_before": max_toi, **res})
+            print("🔧 GOALIE TOI REPAIR:", ds_key, season, res)
+
+    return report
+
+# ======================================================================================
+# AUDIT (inventory + sanity: RS-only + TOI thresholds)
+# ======================================================================================
+def inventory_parquet_tree(root: Path) -> pd.DataFrame:
+    rows = []
+    if not root.exists():
+        return pd.DataFrame(rows)
+
+    for ds_dir in sorted([p for p in root.iterdir() if p.is_dir()]):
+        dataset_key = ds_dir.name
+        for sit_dir in sorted([p for p in ds_dir.iterdir() if p.is_dir() and p.name.startswith("situation=")]):
+            situation = sit_dir.name.split("=", 1)[1]
+            for season_dir in sorted([p for p in sit_dir.iterdir() if p.is_dir() and p.name.startswith("season=")]):
+                season = int(season_dir.name.split("=",1)[1])
+                parts = sorted(season_dir.glob("part_*.parquet"))
+                if not parts:
+                    continue
+                pf = pq.ParquetFile(parts[0])
+                ncols = len(pf.schema_arrow)
+                nrows = sum(pq.ParquetFile(f).metadata.num_rows for f in parts)
+
+                rows.append({
+                    "dataset_key": dataset_key,
+                    "situation": situation,
+                    "season": season,
+                    "parts": len(parts),
+                    "rows": int(nrows),
+                    "cols": int(ncols),
+                    "first_part": str(parts[0]),
+                    "schema_checksum": schema_checksum_from_parquet(parts[0]),
+                })
+    return pd.DataFrame(rows)
+
+def audit_gold(root: Path) -> tuple[pd.DataFrame, pd.DataFrame, Path]:
+    def _infer_level(dataset_key: str):
+        if "skaters" in dataset_key: return "skaters"
+        if "goalies" in dataset_key: return "goalies"
+        if "teams" in dataset_key:   return "teams"
+        if "lines" in dataset_key:   return "lines"
+        return "other"
+
+    def _thr(level: str):
+        if level == "teams": return 70
+        if level == "goalies": return 70
+        if level == "skaters": return 45
+        if level == "lines": return 45
+        return 999
+
+    rows = []
+    for p in sorted(root.glob("**/part_*.parquet")):
+        rel = p.relative_to(root).parts
+        dataset_key = rel[0]
+        situation = rel[1].split("=",1)[1] if len(rel)>1 and rel[1].startswith("situation=") else None
+        season = rel[2].split("=",1)[1] if len(rel)>2 and rel[2].startswith("season=") else None
+        level = _infer_level(dataset_key)
+        toi_thr = _thr(level)
+
+        df = pd.read_parquet(p, engine="pyarrow")
+        nrows, ncols = df.shape
+
+        bad_gametype = 0
+        playoff_ones = 0
+        toi_bad = 0
+        toi_max = np.nan
+        dmin = dmax = None
+
+        if "gameid" in df.columns:
+            gid = df["gameid"].astype(str).str.zfill(10)
+            gt = gid.str[4:6]
+            bad_gametype = int((gt != "02").sum())
+
+        if "playoffgame" in df.columns:
+            playoff_ones = int((df["playoffgame"].fillna(0).astype(int) != 0).sum())
+
+        if "TOI" in df.columns:
+            toi_max = float(pd.to_numeric(df["TOI"], errors="coerce").max(skipna=True))
+            toi_bad = int((pd.to_numeric(df["TOI"], errors="coerce") > toi_thr).sum())
+
+        if "gamedate" in df.columns:
+            gd = pd.to_datetime(df["gamedate"], errors="coerce")
+            dmin, dmax = gd.min(), gd.max()
+
+        rows.append({
+            "dataset_key": dataset_key,
+            "situation": situation,
+            "season": int(season) if season and str(season).isdigit() else season,
+            "level": level,
+            "part_path": str(p),
+            "rows": int(nrows),
+            "cols": int(ncols),
+            "date_min": dmin,
+            "date_max": dmax,
+            "TOI_max": toi_max,
+            "TOI_bad_rows": int(toi_bad),
+            "bad_gametype_rows": int(bad_gametype),
+            "playoffgame_ones": int(playoff_ones),
+        })
+
+    report = pd.DataFrame(rows)
+    by_ds = (report.groupby(["dataset_key","situation"])
+                   .agg(parts=("part_path","count"),
+                        rows=("rows","sum"),
+                        max_TOI=("TOI_max","max"),
+                        bad_gametype=("bad_gametype_rows","sum"),
+                        playoff_ones=("playoffgame_ones","sum"),
+                        toi_bad=("TOI_bad_rows","sum"),
+                        date_min=("date_min","min"),
+                        date_max=("date_max","max"))
+                   .reset_index())
+
+    out_csv = LOG_DIR / f"gold_audit_{RUN_ID}.csv"
+    report.to_csv(out_csv, index=False)
+
+    print("GOLD parts scanned:", len(report))
+    print("Any non-02 gametypes?:", int((report["bad_gametype_rows"] > 0).sum()))
+    print("Any playoffgame==1 rows?:", int((report["playoffgame_ones"] > 0).sum()))
+    print("Any TOI_bad_rows?:", int((report["TOI_bad_rows"] > 0).sum()))
+    print("Saved audit CSV:", out_csv)
+
+    return report, by_ds, out_csv
+
+def run_audit() -> dict:
+    out = {"run_id": RUN_ID, "run_at": utc_now_iso()}
+
+    inv = inventory_parquet_tree(GOLD_DIR)
+    inv_path = LOG_DIR / f"inventory_gold_{RUN_ID}.csv"
+    inv.to_csv(inv_path, index=False)
+    out["inventory_csv"] = str(inv_path)
+    out["inventory_rows"] = int(len(inv))
+
+    rpt, summary, audit_csv = audit_gold(GOLD_DIR)
+    out["gold_audit_csv"] = str(audit_csv)
+
+    summary_path = LOG_DIR / f"gold_audit_summary_{RUN_ID}.csv"
+    summary.to_csv(summary_path, index=False)
+    out["gold_audit_summary_csv"] = str(summary_path)
+
+    audit_json = LOG_DIR / f"audit_bundle_{RUN_ID}.json"
+    write_json(audit_json, out)
+    print("\n✅ AUDIT bundle:", audit_json)
+    return out
 
 # ======================================================================================
 # RUN ALL
